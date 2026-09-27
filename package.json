@@ -1,0 +1,8 @@
+{
+  "name": "fax-tradingview-image-to-notion",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {"sync": "node sync.js"},
+  "dependencies": {"@notionhq/client": "^5.6.0"}
+}
