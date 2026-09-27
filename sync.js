@@ -1,145 +1,223 @@
-import { Client } from '@notionhq/client';
+const { Client } = require("@notionhq/client");
+
+const notion = new Client({
+  auth: process.env.NOTION_TOKEN
+});
 
 const API_URL = process.env.API_URL;
-const NOTION_TOKEN = process.env.NOTION_TOKEN;
 const DATABASE_ID = process.env.NOTION_DATABASE_ID;
-const NOTION_VERSION = '2026-03-11';
-const IMAGE_PROPERTY = process.env.IMAGE_PROPERTY || 'Image';
-const TRADE_PROPERTY = process.env.TRADE_PROPERTY || 'TRADE NO';
-const SCREENSHOT_PROPERTY = process.env.SCREENSHOT_PROPERTY || 'Screenshot';
 
-if (!API_URL || !NOTION_TOKEN || !DATABASE_ID) {
-  throw new Error('Missing API_URL, NOTION_TOKEN, or NOTION_DATABASE_ID GitHub Secret.');
+const IMAGE_PROPERTY = "Image";
+
+function tradingViewImageUrl(url) {
+  if (!url) return null;
+
+  const match = url.match(
+    /tradingview\.com\/x\/([A-Za-z0-9_-]+)\/?/i
+  );
+
+  if (!match) return null;
+
+  const snapshotId = match[1];
+
+  // TradingView snapshot image
+  return `https://s3.tradingview.com/snapshots/${snapshotId[0].toLowerCase()}/${snapshotId}.png`;
 }
 
-const notion = new Client({ auth: NOTION_TOKEN, notionVersion: NOTION_VERSION });
+function getTradeNo(properties) {
+  for (const key of Object.keys(properties)) {
+    if (key.trim().toUpperCase() === "TRADE NO") {
+      const p = properties[key];
 
-async function getJson(url) {
-  const res = await fetch(url, { headers: { Accept: 'application/json' } });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`Google API HTTP ${res.status}: ${text.slice(0, 1000)}`);
-  try { return JSON.parse(text); } catch { throw new Error(`Google API did not return JSON: ${text.slice(0, 1000)}`); }
-}
+      if (p.type === "title" && p.title?.length) {
+        return p.title.map(x => x.plain_text || "").join("").trim();
+      }
 
-function getTradingViewImageUrl(value) {
-  if (!value) return null;
-  const url = String(value).trim();
+      if (p.type === "rich_text" && p.rich_text?.length) {
+        return p.rich_text.map(x => x.plain_text || "").join("").trim();
+      }
 
-  // TradingView snapshot link: https://www.tradingview.com/x/ABC123/
-  const match = url.match(/^https?:\/\/(?:www\.)?tradingview\.com\/x\/([A-Za-z0-9_-]+)\/?(?:\?.*)?$/i);
-  if (match) {
-    const id = match[1];
-    // TradingView snapshot image path uses the first character of the snapshot id.
-    return `https://s3.tradingview.com/snapshots/${id[0].toLowerCase()}/${id}.png`;
+      if (p.type === "number" && p.number !== null) {
+        return String(p.number);
+      }
+    }
   }
-
-  // If the sheet already contains a direct image URL, use it as-is.
-  if (/^https?:\/\/.+\.(?:png|jpe?g|gif|webp)(?:\?.*)?$/i.test(url)) return url;
 
   return null;
 }
 
-function getPropertyText(prop) {
-  if (!prop) return '';
-  if (prop.type === 'title') return (prop.title || []).map(x => x.plain_text || '').join('');
-  if (prop.type === 'rich_text') return (prop.rich_text || []).map(x => x.plain_text || '').join('');
-  if (prop.type === 'url') return prop.url || '';
-  if (prop.type === 'number') return prop.number == null ? '' : String(prop.number);
-  if (prop.type === 'select') return prop.select?.name || '';
-  if (prop.type === 'status') return prop.status?.name || '';
-  return '';
-}
-
 async function getDataSourceId() {
-  const db = await notion.databases.retrieve({ database_id: DATABASE_ID });
-  const sources = db.data_sources || db.dataSources || [];
-  if (!sources.length) throw new Error('No Notion data source was found in the database.');
-  return sources[0].id;
+  const response = await notion.databases.retrieve({
+    database_id: DATABASE_ID
+  });
+
+  if (!response.data_sources || response.data_sources.length === 0) {
+    throw new Error("No Notion data source found.");
+  }
+
+  return response.data_sources[0].id;
 }
 
-async function getAllPages(dataSourceId) {
+async function getNotionPages(dataSourceId) {
   const pages = [];
-  let cursor;
+  let cursor = undefined;
+
   do {
-    const body = { page_size: 100 };
-    if (cursor) body.start_cursor = cursor;
-    const r = await notion.request({
-      path: `data_sources/${dataSourceId}/query`,
-      method: 'post',
-      body
+    const response = await notion.dataSources.query({
+      data_source_id: dataSourceId,
+      start_cursor: cursor,
+      page_size: 100
     });
-    pages.push(...(r.results || []));
-    cursor = r.has_more ? r.next_cursor : undefined;
+
+    pages.push(...response.results);
+    cursor = response.has_more ? response.next_cursor : undefined;
   } while (cursor);
+
   return pages;
 }
 
-async function updateImage(pageId, imageUrl) {
-  await notion.pages.update({
-    page_id: pageId,
-    properties: {
-      [IMAGE_PROPERTY]: {
-        files: [{
-          type: 'external',
-          name: 'TradingView chart',
-          external: { url: imageUrl }
-        }]
-      }
-    }
-  });
-}
-
 async function main() {
-  console.log('IMAGE-ONLY SYNC STARTED');
+  console.log("IMAGE-ONLY SYNC STARTED");
   console.log(`Image property: ${IMAGE_PROPERTY}`);
 
-  const apiRows = await getJson(API_URL);
-  if (!Array.isArray(apiRows)) throw new Error('Google API response is not an array.');
-  console.log(`Google API rows: ${apiRows.length}`);
+  // ---------------------------------------------------------
+  // 1. Get Google API data
+  // ---------------------------------------------------------
 
-  const dataSourceId = await getDataSourceId();
-  console.log(`Notion data source: ${dataSourceId}`);
+  const apiResponse = await fetch(API_URL);
 
-  const pages = await getAllPages(dataSourceId);
-  console.log(`Notion pages: ${pages.length}`);
-
-  // Map pages by TRADE NO. We only update the Image property.
-  const pageByTrade = new Map();
-  for (const page of pages) {
-    const trade = getPropertyText(page.properties?.[TRADE_PROPERTY]).trim();
-    if (trade) pageByTrade.set(trade, page.id);
+  if (!apiResponse.ok) {
+    throw new Error(
+      `Google API failed: ${apiResponse.status} ${apiResponse.statusText}`
+    );
   }
 
-  let updated = 0, skipped = 0, missing = 0, failed = 0;
+  const rows = await apiResponse.json();
 
-  for (const row of apiRows) {
-    const trade = String(row[TRADE_PROPERTY] ?? row['TRADE NO'] ?? row._row ?? '').trim();
-    const screenshot = String(row[SCREENSHOT_PROPERTY] ?? row['Screenshot'] ?? row['ScreenshotUrl'] ?? '').trim();
-    const imageUrl = getTradingViewImageUrl(screenshot);
+  console.log(`Google API rows: ${rows.length}`);
 
-    if (!trade) { console.log('SKIP: no TRADE NO'); skipped++; continue; }
-    if (!imageUrl) { console.log(`SKIP Trade ${trade}: no supported Screenshot URL`); skipped++; continue; }
+  // ---------------------------------------------------------
+  // 2. Get Notion data source
+  // ---------------------------------------------------------
 
-    const pageId = pageByTrade.get(trade);
-    if (!pageId) { console.log(`MISSING Trade ${trade}: no matching Notion page`); missing++; continue; }
+  const dataSourceId = await getDataSourceId();
 
-    try {
-      await updateImage(pageId, imageUrl);
-      console.log(`UPDATED Trade ${trade} -> ${imageUrl}`);
-      updated++;
-      // Small delay to be gentle with API rate limits.
-      await new Promise(r => setTimeout(r, 250));
-    } catch (err) {
-      failed++;
-      console.error(`FAILED Trade ${trade}: ${err.message}`);
+  console.log(`Notion data source: ${dataSourceId}`);
+
+  // ---------------------------------------------------------
+  // 3. Get Notion pages
+  // ---------------------------------------------------------
+
+  const pages = await getNotionPages(dataSourceId);
+
+  console.log(`Notion pages: ${pages.length}`);
+
+  // Map Trade No → Notion page
+  const pageMap = new Map();
+
+  for (const page of pages) {
+    const tradeNo = getTradeNo(page.properties);
+
+    if (tradeNo) {
+      pageMap.set(tradeNo, page);
     }
   }
 
-  console.log(`DONE — updated: ${updated}, skipped: ${skipped}, missing Notion pages: ${missing}, failed: ${failed}`);
-  if (failed > 0) process.exitCode = 1;
+  let updated = 0;
+  let skipped = 0;
+  let missing = 0;
+  let failed = 0;
+
+  // ---------------------------------------------------------
+  // 4. Process each Google row
+  // ---------------------------------------------------------
+
+  for (const row of rows) {
+    const tradeNo = String(row["TRADE NO"] || "").trim();
+
+    if (!tradeNo) {
+      console.log("SKIP row: missing Trade No");
+      skipped++;
+      continue;
+    }
+
+    const page = pageMap.get(tradeNo);
+
+    if (!page) {
+      console.log(`MISSING Trade ${tradeNo}: Notion page not found`);
+      missing++;
+      continue;
+    }
+
+    // IMPORTANT:
+    // Use ScreenshotUrl, NOT Screenshot
+    const screenshotUrl =
+      row["ScreenshotUrl"] ||
+      row["ScreenshotURL"] ||
+      row["Screenshot Url"] ||
+      "";
+
+    if (!screenshotUrl) {
+      console.log(
+        `SKIP Trade ${tradeNo}: ScreenshotUrl is empty`
+      );
+      skipped++;
+      continue;
+    }
+
+    const imageUrl = tradingViewImageUrl(screenshotUrl);
+
+    if (!imageUrl) {
+      console.log(
+        `SKIP Trade ${tradeNo}: unsupported ScreenshotUrl: ${screenshotUrl}`
+      );
+      skipped++;
+      continue;
+    }
+
+    console.log(`Trade ${tradeNo}`);
+    console.log(`  ScreenshotUrl: ${screenshotUrl}`);
+    console.log(`  Image: ${imageUrl}`);
+
+    try {
+      await notion.pages.update({
+        page_id: page.id,
+        properties: {
+          [IMAGE_PROPERTY]: {
+            files: [
+              {
+                type: "external",
+                name: `Trade ${tradeNo}`,
+                external: {
+                  url: imageUrl
+                }
+              }
+            ]
+          }
+        }
+      });
+
+      console.log(`  UPDATED Trade ${tradeNo}`);
+      updated++;
+
+    } catch (error) {
+      failed++;
+
+      console.error(
+        `  FAILED Trade ${tradeNo}:`,
+        error.body || error.message || error
+      );
+    }
+  }
+
+  console.log("");
+  console.log(
+    `DONE — updated: ${updated}, skipped: ${skipped}, missing Notion pages: ${missing}, failed: ${failed}`
+  );
 }
 
-main().catch(err => {
-  console.error(err.stack || err.message || err);
+main().catch(error => {
+  console.error("FATAL ERROR:");
+  console.error(error.body || error.message || error);
   process.exit(1);
 });
