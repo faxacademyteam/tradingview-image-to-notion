@@ -1,0 +1,32 @@
+name: TradingView Image Only Sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 8 * * *'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Sync TradingView images to Notion
+        env:
+          API_URL: ${{ secrets.API_URL }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          IMAGE_PROPERTY: Image
+          TRADE_PROPERTY: TRADE NO
+          SCREENSHOT_PROPERTY: Screenshot
+        run: npm run sync
